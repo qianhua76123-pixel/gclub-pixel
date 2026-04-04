@@ -1,20 +1,16 @@
-"""End-to-end pixel art asset pipeline.
+"""End-to-end pixel art pipeline: ComfyUI → consistent characters → game assets.
 
-One function call: description → ComfyUI generation → auto-processing →
-animation frames → SpriteSheet + GIF export.
-
-This is the final integrated pipeline that combines everything:
-1. ComfyUI generates high-quality pixel art via SD + LoRA
-2. Auto post-processing: remove bg, crop, resize, palette quantize, outline
-3. Multi-pose generation for animation sheets
-4. Frame interpolation for smooth animations
-5. Export to all formats (PNG, SpriteSheet, GIF, Godot, Phaser)
+Proven workflow:
+1. txt2img generates reference idle frame (white background)
+2. img2img uses reference to generate pose variants (consistent character)
+3. White background removed via simple RGB threshold
+4. Resize + outline → game-ready PixelCanvas
+5. Assemble animation frames → SpriteSheet + GIF
 
 Example:
     >>> from gclub_pixel.pipeline import PixelPipeline
     >>> pipe = PixelPipeline()
     >>> assets = pipe.create_character("medieval knight with silver armor")
-    >>> # → outputs: idle.gif, walk.gif, attack.gif, spritesheet.png, all individual frames
 """
 
 from __future__ import annotations
@@ -27,211 +23,262 @@ import urllib.parse
 import urllib.request
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from PIL import Image
 
 from gclub_pixel.canvas import PixelCanvas
 from gclub_pixel.animation import Animation
-from gclub_pixel.palette import get_palette, color_ramp, shade
-from gclub_pixel.export import export_spritesheet_with_meta, export_phaser_atlas
+from gclub_pixel.export import export_spritesheet_with_meta
 
 
 # ================================================================
-# Prompt engineering templates
+# Prompts
 # ================================================================
 
-_PIXEL_POSITIVE_BASE = (
-    "pixel art, pixel sprite, 16-bit retro game character, "
-    "{description}, "
-    "{pose_prompt}, "
-    "full body, centered, plain white background, white backdrop, "
-    "clean sharp pixels, no anti-aliasing, limited color palette, "
-    "dark pixel outlines, RPG game sprite, masterpiece, high quality pixel art"
-)
-
-_PIXEL_NEGATIVE = (
-    "blurry, realistic, photographic, 3d render, smooth gradients, "
-    "anti-aliased, text, watermark, signature, multiple characters, "
-    "detailed background, scenery, low quality, deformed, ugly, "
-    "painted, oil painting, sketch, line art"
-)
-
-_POSE_PROMPTS = {
-    "idle":      "front view, standing idle pose, relaxed stance, arms at sides",
-    "walk_1":    "front view, walking pose left foot forward, mid-stride",
-    "walk_2":    "front view, walking pose right foot forward, mid-stride",
-    "attack_1":  "front view, attack wind-up pose, weapon pulled back, ready to strike",
-    "attack_2":  "front view, attack swing pose, weapon swinging forward, action pose",
-    "attack_3":  "front view, attack follow-through pose, weapon extended",
-    "hurt":      "front view, taking damage pose, recoiling backward, pained expression",
-    "cast":      "front view, casting magic spell, hands glowing with energy, magical pose",
-    "jump":      "front view, jumping in air pose, feet off ground, arms up",
-    "crouch":    "front view, crouching low, defensive stance",
-    "dead":      "lying on ground, defeated pose, fallen",
+_STYLE_MODS = {
+    "stardew":  "stardew valley style, warm colors, cute chibi, cozy",
+    "deadcells": "dead cells style, dark detailed shading, glowing accents",
+    "terraria": "terraria style, colorful vibrant, visible armor details",
+    "celeste":  "celeste style, clean minimal, strong silhouette",
+    "classic":  "SNES RPG style, final fantasy, chrono trigger, 16-bit era",
+    "default":  "retro RPG style, clean pixel art",
 }
 
-_STYLE_MODIFIERS = {
-    "stardew":   "stardew valley style, warm colors, cute chibi, cozy",
-    "deadcells": "dead cells style, dark moody, detailed shading, glowing accents",
-    "terraria":  "terraria style, colorful vibrant, visible armor details",
-    "celeste":   "celeste style, clean minimal, strong silhouette, expressive",
-    "classic":   "SNES RPG style, Final Fantasy style, chrono trigger, 16-bit era",
-    "default":   "retro RPG style, clean pixel art, balanced proportions",
+_POSE_DESC = {
+    "idle":     "standing idle, relaxed, arms at sides",
+    "walk_1":   "walking, left foot forward, mid-stride",
+    "walk_2":   "walking, right foot forward, mid-stride",
+    "attack_1": "wind-up attack pose, weapon pulled back",
+    "attack_2": "swinging weapon forward, action pose",
+    "hurt":     "taking damage, recoiling backward",
+    "cast":     "casting magic, hands glowing",
+    "jump":     "jumping, feet off ground",
 }
 
+_NEGATIVE = (
+    "blurry, realistic, 3d, smooth, anti-aliased, gradient, text, watermark, "
+    "multiple characters, background scenery, low quality, deformed, ugly, painted"
+)
 
-class PixelPipeline:
-    """Complete pixel art asset generation pipeline.
 
-    Connects to a local ComfyUI instance, generates images via
-    Stable Diffusion + LoRA, and auto-processes into game-ready assets.
+def _build_positive(desc: str, pose: str, style: str) -> str:
+    pose_text = _POSE_DESC.get(pose, "standing idle")
+    style_text = _STYLE_MODS.get(style, _STYLE_MODS["default"])
+    return (
+        f"pixel art sprite, 16-bit game character, {desc}, "
+        f"{pose_text}, front view, full body, centered, "
+        f"plain white background, white backdrop, "
+        f"sharp pixels, limited palette, dark outlines, "
+        f"{style_text}, masterpiece, high quality"
+    )
 
-    Args:
-        comfyui_url: ComfyUI server URL.
-        model: Checkpoint model filename.
-        lora: LoRA filename for pixel art style.
-        lora_strength: LoRA weight (0.8-1.3 recommended).
-        target_size: Output sprite size in pixels.
-        style: Art style preset name.
 
-    Example:
-        >>> pipe = PixelPipeline()
-        >>> pipe.create_character("fire mage with red robes", output_dir="./assets/")
-    """
+# ================================================================
+# ComfyUI helpers
+# ================================================================
 
-    def __init__(
-        self,
-        comfyui_url: str = "http://localhost:8188",
-        model: str = "dreamshaper_8.safetensors",
-        lora: str = "pixel-art-sd15.safetensors",
-        lora_strength: float = 1.2,
-        target_size: int = 32,
-        style: str = "default",
-    ):
-        self.url = comfyui_url.rstrip("/")
-        self.model = model
-        self.lora = lora
-        self.lora_strength = lora_strength
-        self.target_size = target_size
-        self.style = style
-
-    def _check_server(self) -> bool:
-        try:
-            urllib.request.urlopen(f"{self.url}/system_stats", timeout=3)
-            return True
-        except Exception:
-            return False
-
-    # ================================================================
-    # Core generation
-    # ================================================================
-
-    def _build_workflow(self, description: str, pose: str = "idle", seed: int = -1) -> dict:
-        """Build ComfyUI API workflow."""
-        if seed < 0:
-            seed = random.randint(0, 2**32)
-
-        pose_prompt = _POSE_PROMPTS.get(pose, _POSE_PROMPTS["idle"])
-        style_mod = _STYLE_MODIFIERS.get(self.style, _STYLE_MODIFIERS["default"])
-
-        positive = _PIXEL_POSITIVE_BASE.format(
-            description=description,
-            pose_prompt=pose_prompt,
-        ) + f", {style_mod}"
-
-        return {
-            "3": {"class_type": "KSampler", "inputs": {
-                "seed": seed, "steps": 30, "cfg": 8.0,
-                "sampler_name": "euler_ancestral", "scheduler": "normal",
-                "denoise": 1.0, "model": ["10", 0], "positive": ["6", 0],
-                "negative": ["7", 0], "latent_image": ["5", 0],
-            }},
-            "4": {"class_type": "CheckpointLoaderSimple",
-                  "inputs": {"ckpt_name": self.model}},
-            "5": {"class_type": "EmptyLatentImage",
-                  "inputs": {"width": 512, "height": 512, "batch_size": 1}},
-            "6": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": positive, "clip": ["10", 1]}},
-            "7": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": _PIXEL_NEGATIVE, "clip": ["10", 1]}},
-            "8": {"class_type": "VAEDecode",
-                  "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
-            "9": {"class_type": "SaveImage",
-                  "inputs": {"filename_prefix": "gclub_pipe", "images": ["8", 0]}},
-            "10": {"class_type": "LoraLoader", "inputs": {
-                "lora_name": self.lora,
-                "strength_model": self.lora_strength,
-                "strength_clip": 1.0,
-                "model": ["4", 0], "clip": ["4", 1],
-            }},
-        }
-
-    def _queue_and_wait(self, workflow: dict, timeout: int = 300) -> Image.Image:
-        """Queue a workflow and wait for the result image."""
-        data = json.dumps({"prompt": workflow}).encode()
+def _comfy_request(url: str, data=None, method="GET") -> dict:
+    """Make a request to ComfyUI API."""
+    if data is not None:
         req = urllib.request.Request(
-            f"{self.url}/prompt", data=data,
+            url, data=json.dumps(data).encode(),
             headers={"Content-Type": "application/json"},
         )
-        resp = urllib.request.urlopen(req)
-        prompt_id = json.loads(resp.read())["prompt_id"]
+    else:
+        req = urllib.request.Request(url)
+    resp = urllib.request.urlopen(req, timeout=10)
+    return json.loads(resp.read())
 
-        for _ in range(timeout):
-            time.sleep(1)
-            try:
-                resp = urllib.request.urlopen(f"{self.url}/history/{prompt_id}")
-                history = json.loads(resp.read())
-                if prompt_id in history and history[prompt_id].get("outputs"):
-                    for node_out in history[prompt_id]["outputs"].values():
-                        if "images" in node_out:
-                            img_info = node_out["images"][0]
-                            params = urllib.parse.urlencode({
-                                "filename": img_info["filename"],
-                                "subfolder": img_info.get("subfolder", ""),
-                                "type": "output",
-                            })
-                            img_data = urllib.request.urlopen(f"{self.url}/view?{params}").read()
-                            return Image.open(BytesIO(img_data)).convert("RGBA")
-            except Exception:
-                pass
 
-        raise TimeoutError(f"Generation timed out after {timeout}s")
+def _upload_image(server: str, img: Image.Image, filename: str) -> str:
+    """Upload a PIL Image to ComfyUI's input folder."""
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    img_bytes = buf.getvalue()
 
-    def generate_raw(self, description: str, pose: str = "idle", seed: int = -1) -> Image.Image:
-        """Generate a single raw 512x512 pixel art image."""
-        workflow = self._build_workflow(description, pose, seed)
-        return self._queue_and_wait(workflow)
+    boundary = "----GClubUpload"
+    body = bytearray()
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'.encode())
+    body.extend(b"Content-Type: image/png\r\n\r\n")
+    body.extend(img_bytes)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
 
-    # ================================================================
-    # Post-processing
-    # ================================================================
+    req = urllib.request.Request(
+        f"{server}/upload/image",
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    result = json.loads(resp.read())
+    return result.get("name", filename)
 
-    def process_image(self, img: Image.Image, palette_name: str = None) -> PixelCanvas:
-        """Process raw SD output → game-ready PixelCanvas.
 
-        Strategy: white bg prompt → remove white/near-white → crop → resize → outline.
-        """
-        w, h = img.size
-        pixels = img.load()
+def _queue_and_wait(server: str, workflow: dict, timeout: int = 180) -> Image.Image:
+    """Queue a workflow and wait for result."""
+    resp = _comfy_request(f"{server}/prompt", data={"prompt": workflow})
+    prompt_id = resp["prompt_id"]
 
-        # 1. Remove white/light background (prompt forces white bg)
-        for y in range(h):
-            for x in range(w):
-                r, g, b, a = pixels[x, y]
-                # If pixel is near-white or very light gray → transparent
-                if r > 210 and g > 210 and b > 210:
-                    pixels[x, y] = (0, 0, 0, 0)
+    for _ in range(timeout):
+        time.sleep(1)
+        try:
+            hist_resp = urllib.request.urlopen(f"{server}/history/{prompt_id}", timeout=5)
+            history = json.loads(hist_resp.read())
+            if prompt_id in history and history[prompt_id].get("outputs"):
+                for node_out in history[prompt_id]["outputs"].values():
+                    if "images" in node_out:
+                        info = node_out["images"][0]
+                        params = urllib.parse.urlencode({
+                            "filename": info["filename"],
+                            "subfolder": info.get("subfolder", ""),
+                            "type": "output",
+                        })
+                        img_data = urllib.request.urlopen(
+                            f"{server}/view?{params}", timeout=15
+                        ).read()
+                        return Image.open(BytesIO(img_data)).convert("RGBA")
+        except Exception:
+            pass
 
-        # 2. Also flood-fill from edges to catch off-white backgrounds
+    raise TimeoutError(f"Generation timed out ({timeout}s)")
+
+
+# ================================================================
+# Workflow builders
+# ================================================================
+
+def _txt2img_workflow(model: str, lora: str, lora_str: float,
+                      positive: str, negative: str, seed: int) -> dict:
+    """Standard txt2img with LoRA."""
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": model}},
+        "2": {"class_type": "LoraLoader", "inputs": {
+            "lora_name": lora, "strength_model": lora_str,
+            "strength_clip": 1.0, "model": ["1", 0], "clip": ["1", 1]}},
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": positive, "clip": ["2", 1]}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": negative, "clip": ["2", 1]}},
+        "5": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        "6": {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": 28, "cfg": 7.5,
+            "sampler_name": "euler_ancestral", "scheduler": "normal",
+            "denoise": 1.0,
+            "model": ["2", 0], "positive": ["3", 0],
+            "negative": ["4", 0], "latent_image": ["5", 0]}},
+        "7": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveImage",
+              "inputs": {"filename_prefix": "gclub_ref", "images": ["7", 0]}},
+    }
+
+
+def _img2img_workflow(model: str, lora: str, lora_str: float,
+                      positive: str, negative: str,
+                      ref_name: str, seed: int, denoise: float) -> dict:
+    """img2img: uses reference image for character consistency."""
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": model}},
+        "2": {"class_type": "LoraLoader", "inputs": {
+            "lora_name": lora, "strength_model": lora_str,
+            "strength_clip": 1.0, "model": ["1", 0], "clip": ["1", 1]}},
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": positive, "clip": ["2", 1]}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": negative, "clip": ["2", 1]}},
+        "5": {"class_type": "LoadImage",
+              "inputs": {"image": ref_name}},
+        "6": {"class_type": "VAEEncode",
+              "inputs": {"pixels": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": 28, "cfg": 7.5,
+            "sampler_name": "euler_ancestral", "scheduler": "normal",
+            "denoise": denoise,
+            "model": ["2", 0], "positive": ["3", 0],
+            "negative": ["4", 0], "latent_image": ["6", 0]}},
+        "8": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
+        "9": {"class_type": "SaveImage",
+              "inputs": {"filename_prefix": "gclub_pose", "images": ["8", 0]}},
+    }
+
+
+# ================================================================
+# Image processing
+# ================================================================
+
+def remove_white_bg(img: Image.Image, threshold: int = 230) -> Image.Image:
+    """Remove white/near-white background from a pixel art image.
+
+    Simple and reliable: any pixel where R, G, B are all > threshold
+    becomes transparent. This works perfectly for images generated with
+    'white background' in the prompt.
+    """
+    img = img.convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if r > threshold and g > threshold and b > threshold:
+                pixels[x, y] = (0, 0, 0, 0)
+    return img
+
+
+def remove_dark_bg(img: Image.Image, threshold: int = 35) -> Image.Image:
+    """Remove dark/near-black background. Fallback when SD ignores white bg prompt."""
+    img = img.convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if r < threshold and g < threshold and b < threshold:
+                pixels[x, y] = (0, 0, 0, 0)
+    return img
+
+
+def smart_remove_bg(img: Image.Image) -> Image.Image:
+    """Auto-detect background color and remove it.
+
+    Samples corners to detect whether bg is white or dark, then applies
+    the appropriate removal. Falls back to edge flood fill if needed.
+    """
+    img = img.convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+
+    # Sample 4 corners + 4 edge midpoints
+    samples = [
+        pixels[2, 2], pixels[w-3, 2], pixels[2, h-3], pixels[w-3, h-3],
+        pixels[w//2, 2], pixels[w//2, h-3], pixels[2, h//2], pixels[w-3, h//2],
+    ]
+    avg_r = sum(s[0] for s in samples) // len(samples)
+    avg_g = sum(s[1] for s in samples) // len(samples)
+    avg_b = sum(s[2] for s in samples) // len(samples)
+    brightness = (avg_r + avg_g + avg_b) / 3
+
+    if brightness > 180:
+        # White/light background
+        return remove_white_bg(img)
+    elif brightness < 60:
+        # Dark/black background
+        return remove_dark_bg(img)
+    else:
+        # Mid-tone bg: flood fill from edges
         visited = set()
-        border_seeds = []
+        border = []
         for bx in range(w):
-            border_seeds.extend([(bx, 0), (bx, h-1)])
+            border.extend([(bx, 0), (bx, h-1)])
         for by in range(h):
-            border_seeds.extend([(0, by), (w-1, by)])
+            border.extend([(0, by), (w-1, by)])
 
-        for sx, sy in border_seeds:
+        for sx, sy in border:
             if (sx, sy) in visited:
                 continue
             stack = [(sx, sy)]
@@ -241,194 +288,136 @@ class PixelPipeline:
                     continue
                 visited.add((cx, cy))
                 r, g, b, a = pixels[cx, cy]
-                if a == 0 or (r > 180 and g > 180 and b > 180):
+                dist = abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
+                if dist < 80:
                     pixels[cx, cy] = (0, 0, 0, 0)
                     for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
                         stack.append((cx+dx, cy+dy))
-
-        # 3. Crop to content bounding box
-        bbox = img.getbbox()
-        if bbox:
-            pad = 4
-            x1 = max(0, bbox[0] - pad)
-            y1 = max(0, bbox[1] - pad)
-            x2 = min(w, bbox[2] + pad)
-            y2 = min(h, bbox[3] + pad)
-            # Make square
-            cw, ch = x2 - x1, y2 - y1
-            side = max(cw, ch)
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            x1 = max(0, cx - side // 2)
-            y1 = max(0, cy - side // 2)
-            x2 = min(w, x1 + side)
-            y2 = min(h, y1 + side)
-            img = img.crop((x1, y1, x2, y2))
-
-        # 4. Resize to target
-        img = img.resize((self.target_size, self.target_size), Image.LANCZOS)
-
-        # 5. Palette quantize
-        if palette_name:
-            img = self._quantize_palette(img, palette_name)
-
-        # 6. Clean alpha
-        pixels = img.load()
-        for y in range(self.target_size):
-            for x in range(self.target_size):
-                r, g, b, a = pixels[x, y]
-                pixels[x, y] = (r, g, b, 255 if a > 50 else 0)
-
-        # 7. Convert to PixelCanvas
-        canvas = PixelCanvas(self.target_size, self.target_size)
-        for y in range(self.target_size):
-            for x in range(self.target_size):
-                r, g, b, a = img.getpixel((x, y))
-                if a > 0:
-                    canvas._pixels[y][x] = (r, g, b, 255)
-
-        # 8. Colored outline
-        canvas.colored_outline()
-        return canvas
-
-    def _remove_bg(self, img: Image.Image) -> Image.Image:
-        """Remove background via edge-only flood fill.
-
-        Only floods from the image borders inward, never starts from center.
-        This protects the character even if it shares colors with the background.
-        Uses a two-pass approach: first identify definite background from edges,
-        then clean up remaining noise.
-        """
-        pixels = img.load()
-        w, h = img.size
-
-        # Sample background color from the 4 edge midpoints (more reliable than corners)
-        edge_samples = [
-            pixels[w//2, 0], pixels[w//2, h-1],
-            pixels[0, h//2], pixels[w-1, h//2],
-            pixels[0, 0], pixels[w-1, 0], pixels[0, h-1], pixels[w-1, h-1],
-        ]
-        # Find most common edge color
-        from collections import Counter
-        color_counts = Counter()
-        for p in edge_samples:
-            # Round to nearest 10 to group similar colors
-            key = (p[0]//10*10, p[1]//10*10, p[2]//10*10)
-            color_counts[key] += 1
-        bg_key = color_counts.most_common(1)[0][0]
-        bg_r, bg_g, bg_b = bg_key
-
-        tolerance = 55
-        visited = set()
-
-        # ONLY seed from border pixels — never from interior
-        border_seeds = []
-        for x in range(w):
-            border_seeds.append((x, 0))
-            border_seeds.append((x, h - 1))
-        for y in range(h):
-            border_seeds.append((0, y))
-            border_seeds.append((w - 1, y))
-
-        stack = border_seeds[:]
-        while stack:
-            x, y = stack.pop()
-            if (x, y) in visited or not (0 <= x < w and 0 <= y < h):
-                continue
-            visited.add((x, y))
-            r, g, b = pixels[x, y][0], pixels[x, y][1], pixels[x, y][2]
-            # Compare with rounded bg color
-            dist = abs(r//10*10 - bg_r) + abs(g//10*10 - bg_g) + abs(b//10*10 - bg_b)
-            if dist < tolerance:
-                pixels[x, y] = (0, 0, 0, 0)
-                for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-                    stack.append((x + dx, y + dy))
-
         return img
 
-    def _crop_center(self, img: Image.Image) -> Image.Image:
-        """Crop to bounding box of content, keep square."""
-        bbox = img.getbbox()
-        if not bbox:
-            return img
-        x1, y1, x2, y2 = bbox
-        # Pad slightly
-        pad = max((x2-x1), (y2-y1)) // 10
-        x1, y1 = max(0, x1-pad), max(0, y1-pad)
-        x2, y2 = min(img.width, x2+pad), min(img.height, y2+pad)
-        # Make square
-        w, h = x2 - x1, y2 - y1
-        side = max(w, h)
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        x1 = max(0, cx - side // 2)
-        y1 = max(0, cy - side // 2)
-        return img.crop((x1, y1, x1 + side, y1 + side))
 
-    def _quantize_palette(self, img: Image.Image, palette_name: str) -> Image.Image:
-        pal = get_palette(palette_name)
-        pixels = img.load()
-        for y in range(img.height):
-            for x in range(img.width):
-                r, g, b, a = pixels[x, y]
-                if a > 0:
-                    pixels[x, y] = (*pal.closest(r, g, b), a)
+def crop_to_content(img: Image.Image) -> Image.Image:
+    """Crop to bounding box of non-transparent pixels, keep square."""
+    bbox = img.getbbox()
+    if not bbox:
         return img
+    x1, y1, x2, y2 = bbox
+    # Small padding
+    pad = max(4, (x2 - x1) // 20)
+    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+    x2, y2 = min(img.width, x2 + pad), min(img.height, y2 + pad)
+    # Make square
+    w, h = x2 - x1, y2 - y1
+    side = max(w, h)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    x1 = max(0, cx - side // 2)
+    y1 = max(0, cy - side // 2)
+    x2 = min(img.width, x1 + side)
+    y2 = min(img.height, y1 + side)
+    return img.crop((x1, y1, x2, y2))
 
-    def _clean_alpha(self, img: Image.Image) -> Image.Image:
-        pixels = img.load()
-        for y in range(img.height):
-            for x in range(img.width):
-                r, g, b, a = pixels[x, y]
-                pixels[x, y] = (r, g, b, 255 if a > 80 else 0)
-        return img
 
-    # ================================================================
-    # High-level API
-    # ================================================================
+def to_pixel_canvas(img: Image.Image, size: int) -> PixelCanvas:
+    """Convert PIL Image to PixelCanvas at target size."""
+    img = img.resize((size, size), Image.LANCZOS)
+    canvas = PixelCanvas(size, size)
+    for y in range(size):
+        for x in range(size):
+            r, g, b, a = img.getpixel((x, y))
+            if a > 50:
+                canvas._pixels[y][x] = (r, g, b, 255)
+    canvas.colored_outline()
+    return canvas
+
+
+def process_raw(img: Image.Image, size: int) -> PixelCanvas:
+    """Full processing: smart bg removal → crop → resize → outline."""
+    img = smart_remove_bg(img)
+    img = crop_to_content(img)
+    return to_pixel_canvas(img, size)
+
+
+# ================================================================
+# Pipeline
+# ================================================================
+
+class PixelPipeline:
+    """Complete pixel art generation pipeline.
+
+    Example:
+        >>> pipe = PixelPipeline()
+        >>> assets = pipe.create_character("knight with silver armor", name="knight")
+    """
+
+    def __init__(
+        self,
+        server: str = "http://localhost:8188",
+        model: str = "dreamshaper_8.safetensors",
+        lora: str = "pixel-art-sd15.safetensors",
+        lora_strength: float = 1.2,
+        size: int = 48,
+        style: str = "default",
+    ):
+        self.server = server
+        self.model = model
+        self.lora = lora
+        self.lora_str = lora_strength
+        self.size = size
+        self.style = style
+
+    def _check(self):
+        try:
+            urllib.request.urlopen(f"{self.server}/system_stats", timeout=3)
+            return True
+        except:
+            return False
+
+    def generate_reference(self, desc: str, seed: int) -> Image.Image:
+        """Step 1: Generate idle reference frame via txt2img."""
+        prompt = _build_positive(desc, "idle", self.style)
+        wf = _txt2img_workflow(self.model, self.lora, self.lora_str, prompt, _NEGATIVE, seed)
+        return _queue_and_wait(self.server, wf)
+
+    def generate_pose(self, desc: str, ref_image: Image.Image,
+                      pose: str, seed: int, denoise: float = 0.5) -> Image.Image:
+        """Step 2: Generate pose variant via img2img from reference."""
+        ref_name = _upload_image(self.server, ref_image, f"gclub_ref_{pose}.png")
+        prompt = _build_positive(desc, pose, self.style)
+        wf = _img2img_workflow(self.model, self.lora, self.lora_str,
+                               prompt, _NEGATIVE, ref_name, seed, denoise)
+        return _queue_and_wait(self.server, wf)
 
     def create_character(
         self,
         description: str,
-        output_dir: str = "./pixel_assets",
         name: str = "character",
+        output_dir: str = "./pixel_assets",
         animations: List[str] = None,
-        palette: str = None,
         seed: int = -1,
     ) -> dict:
-        """Generate a complete character asset pack.
+        """Generate a complete character asset pack with consistent appearance.
 
-        Creates: idle sprite, animation frames for each requested animation,
-        spritesheet, GIF, and individual frame PNGs.
+        Pipeline:
+        1. txt2img → reference idle frame (establishes character look)
+        2. img2img → pose variants from reference (consistent colors/style)
+        3. Remove white background → crop → resize → outline
+        4. Assemble into SpriteSheet + GIF
 
         Args:
-            description: Character description (e.g., "medieval knight with silver armor").
-            output_dir: Where to save all assets.
-            name: Character name (used for filenames).
-            animations: List of animations to generate. Default: ["idle", "walk", "attack", "hurt"].
-                       Each animation generates 3-4 pose variants → interpolated into smooth frames.
-            palette: Optional palette name for color quantization.
-            seed: Random seed for reproducibility (-1 = random).
+            description: Character description.
+            name: Character name for filenames.
+            output_dir: Output directory.
+            animations: Which animations to generate (default: idle, walk, attack, hurt).
+            seed: Random seed (-1 = random).
 
         Returns:
-            Dict with paths to all generated assets.
-
-        Example:
-            >>> pipe = PixelPipeline(style="deadcells")
-            >>> assets = pipe.create_character(
-            ...     "fire mage with red robes and flame staff",
-            ...     name="fire_mage",
-            ...     output_dir="./game_assets/"
-            ... )
-            >>> print(assets["idle_gif"])  # → ./game_assets/fire_mage/fire_mage_idle.gif
+            Dict with all asset file paths.
         """
-        if not self._check_server():
-            raise ConnectionError(
-                "Cannot connect to ComfyUI. Start it with: "
-                "cd ~/ComfyUI && source venv/bin/activate && python main.py --listen"
-            )
+        if not self._check():
+            raise ConnectionError("ComfyUI not running. Start: cd ~/ComfyUI && source venv/bin/activate && python main.py --listen")
 
         if animations is None:
             animations = ["idle", "walk", "attack", "hurt"]
-
         if seed < 0:
             seed = random.randint(0, 2**32)
 
@@ -436,231 +425,122 @@ class PixelPipeline:
         out.mkdir(parents=True, exist_ok=True)
         (out / "frames").mkdir(exist_ok=True)
 
-        result = {"name": name, "dir": str(out), "sprites": {}, "sheets": {}, "gifs": {}}
+        result = {"name": name, "sprites": {}, "sheets": {}, "gifs": {}}
 
-        # --- Generate base idle sprite ---
-        print(f"[{name}] Generating idle sprite...")
-        raw = self.generate_raw(description, pose="idle", seed=seed)
-        idle_canvas = self.process_image(raw, palette)
-        idle_path = str(out / f"{name}_idle.png")
-        idle_canvas.save(idle_path, scale=1)
-        idle_canvas.save(str(out / f"{name}_idle_preview.png"), scale=8)
-        result["sprites"]["idle"] = idle_path
-        print(f"  idle: done")
+        # === Step 1: Reference idle frame ===
+        print(f"[{name}] Step 1: Generating reference idle (txt2img)...")
+        ref_raw = self.generate_reference(description, seed)
+        ref_raw.save(str(out / "_reference_raw.png"))
+        idle_canvas = process_raw(ref_raw, self.size)
+        idle_canvas.save(str(out / f"{name}_idle.png"))
+        idle_canvas.save(str(out / f"{name}_idle_8x.png"), scale=8)
+        result["sprites"]["idle"] = str(out / f"{name}_idle.png")
 
-        # --- Generate animation poses ---
+        content_px = sum(1 for y in range(self.size) for x in range(self.size) if idle_canvas.get_pixel(x, y)[3] > 0)
+        print(f"  Reference: {content_px}px content")
+
+        if content_px < 50:
+            print(f"  WARNING: Low content. Background removal may have eaten the character.")
+
+        # === Step 2: Pose variants via img2img ===
         pose_map = {
-            "idle":   ["idle"],
-            "walk":   ["idle", "walk_1", "idle", "walk_2"],
-            "attack": ["idle", "attack_1", "attack_2", "attack_3", "idle"],
-            "hurt":   ["idle", "hurt", "hurt", "idle"],
-            "cast":   ["idle", "cast", "cast", "idle"],
-            "jump":   ["crouch", "jump", "jump", "idle"],
-            "death":  ["hurt", "dead"],
+            "idle":   [("idle", 0.3)],
+            "walk":   [("idle", 0.0), ("walk_1", 0.5), ("idle", 0.0), ("walk_2", 0.5)],
+            "attack": [("idle", 0.0), ("attack_1", 0.55), ("attack_2", 0.6), ("idle", 0.0)],
+            "hurt":   [("idle", 0.0), ("hurt", 0.5), ("hurt", 0.45), ("idle", 0.0)],
         }
 
+        pose_cache = {"idle": idle_canvas}
         all_anim_frames = {}
 
-        for anim_name in animations:
-            poses = pose_map.get(anim_name, ["idle"])
+        for anim in animations:
+            poses = pose_map.get(anim, [("idle", 0.0)])
             frames = []
 
-            print(f"[{name}] Generating {anim_name} ({len(poses)} poses)...")
-            for i, pose in enumerate(poses):
-                # Use consistent seed per character, vary by pose index
-                pose_seed = seed + hash(pose) % 1000 + i
-                raw = self.generate_raw(description, pose=pose, seed=pose_seed)
-                canvas = self.process_image(raw, palette)
-                frames.append(canvas)
+            print(f"[{name}] Step 2: Generating {anim} ({len(poses)} frames, img2img)...")
+            for i, (pose, denoise) in enumerate(poses):
+                if denoise == 0.0 and pose in pose_cache:
+                    frames.append(pose_cache[pose])
+                    print(f"  {anim}[{i}] {pose}: reuse cached")
+                    continue
+
+                if pose in pose_cache and denoise < 0.35:
+                    frames.append(pose_cache[pose])
+                    print(f"  {anim}[{i}] {pose}: reuse (low denoise)")
+                    continue
+
+                pose_seed = seed + hash(f"{pose}_{i}") % 10000
+                print(f"  {anim}[{i}] {pose} (denoise={denoise})...", end=" ", flush=True)
+                try:
+                    raw = self.generate_pose(description, ref_raw, pose, pose_seed, denoise)
+                    canvas = process_raw(raw, self.size)
+                    px = sum(1 for y in range(self.size) for x in range(self.size) if canvas.get_pixel(x, y)[3] > 0)
+                    print(f"{px}px")
+
+                    if px < 50:
+                        print(f"    Low content, using idle fallback")
+                        canvas = idle_canvas
+
+                    pose_cache[pose] = canvas
+                    frames.append(canvas)
+                except Exception as e:
+                    print(f"failed: {e}, using idle")
+                    frames.append(idle_canvas)
 
                 # Save individual frame
-                frame_path = str(out / "frames" / f"{name}_{anim_name}_{i:02d}.png")
-                canvas.save(frame_path)
-                print(f"  {anim_name} frame {i+1}/{len(poses)}: done")
+                canvas.save(str(out / "frames" / f"{name}_{anim}_{i:02d}.png"))
 
-            all_anim_frames[anim_name] = frames
+            all_anim_frames[anim] = frames
 
-            # --- Build animation from frames ---
-            anim = Animation(frames[0], fps=6)
-            anim.frames = frames
+            # === Step 3: Assemble animation ===
+            animation = Animation(frames[0], fps=6)
+            animation.frames = frames
 
-            # Export SpriteSheet
-            sheet_path = str(out / f"{name}_{anim_name}_sheet.png")
-            anim.export_spritesheet(sheet_path, scale=1)
-            anim.export_spritesheet(
-                str(out / f"{name}_{anim_name}_sheet_preview.png"), scale=4
-            )
-            result["sheets"][anim_name] = sheet_path
+            sheet_path = str(out / f"{name}_{anim}_sheet.png")
+            animation.export_spritesheet(sheet_path, scale=4)
+            result["sheets"][anim] = sheet_path
 
-            # Export GIF
-            gif_path = str(out / f"{name}_{anim_name}.gif")
-            anim.export_gif(gif_path, scale=4)
-            result["gifs"][anim_name] = gif_path
+            gif_path = str(out / f"{name}_{anim}.gif")
+            animation.export_gif(gif_path, scale=4)
+            result["gifs"][anim] = gif_path
 
-            print(f"  {anim_name}: sheet + gif exported")
+            print(f"  {anim}: sheet + gif exported")
 
-        # --- Export combined master spritesheet ---
-        all_frames = []
-        anim_ranges = {}
-        idx = 0
-        for anim_name in animations:
-            frames = all_anim_frames.get(anim_name, [])
-            anim_ranges[anim_name] = {"start": idx, "count": len(frames)}
-            all_frames.extend(frames)
-            idx += len(frames)
-
-        if all_frames:
-            meta = export_spritesheet_with_meta(
-                all_frames, name, str(out), columns=max(len(f) for f in all_anim_frames.values())
-            )
-            meta["animations"] = anim_ranges
-            # Overwrite meta with animation info
-            (Path(out) / f"{name}.json").write_text(json.dumps(meta, indent=2))
-            result["master_sheet"] = str(out / f"{name}.png")
-            result["master_meta"] = str(out / f"{name}.json")
-
-        # --- Summary ---
-        total_frames = sum(len(f) for f in all_anim_frames.values())
+        # === Summary ===
+        total = sum(len(f) for f in all_anim_frames.values())
         print(f"\n{'='*40}")
-        print(f"  Character: {name}")
-        print(f"  Size: {self.target_size}x{self.target_size}px")
-        print(f"  Animations: {', '.join(animations)}")
-        print(f"  Total frames: {total_frames}")
+        print(f"  {name}: {total} frames, {len(animations)} animations")
         print(f"  Output: {out}/")
         print(f"{'='*40}")
 
         return result
 
-    def create_party(
-        self,
-        characters: Dict[str, str],
-        output_dir: str = "./pixel_assets",
-        animations: List[str] = None,
-        palette: str = None,
-    ) -> Dict[str, dict]:
-        """Generate a full party of characters with consistent style.
-
-        Args:
-            characters: Dict of {name: description}.
-            output_dir: Output directory.
-            animations: Animations to generate per character.
-
-        Returns:
-            Dict of {name: asset_result}.
-
-        Example:
-            >>> pipe = PixelPipeline(style="classic")
-            >>> party = pipe.create_party({
-            ...     "knight": "medieval knight with silver armor and red cape",
-            ...     "mage": "wizard in purple robes with magic staff",
-            ...     "archer": "ranger with green cloak and bow",
-            ... })
-        """
-        results = {}
-        for name, desc in characters.items():
-            print(f"\n--- Generating {name} ---")
-            results[name] = self.create_character(
-                desc, output_dir=output_dir, name=name,
-                animations=animations, palette=palette,
-            )
-        return results
-
-    def create_item(
-        self,
-        description: str,
-        output_dir: str = "./pixel_assets",
-        name: str = "item",
-        palette: str = None,
-    ) -> str:
-        """Generate a single item/icon sprite.
-
-        Example:
-            >>> pipe.create_item("red health potion", name="hp_potion")
-        """
-        if not self._check_server():
-            raise ConnectionError("ComfyUI not running")
-
-        out = Path(output_dir) / "items"
-        out.mkdir(parents=True, exist_ok=True)
-
-        print(f"[item] Generating {name}...")
-        prompt_desc = f"pixel art game item icon, {description}, single item, centered, no character"
-        raw = self.generate_raw(prompt_desc, pose="idle")
-        canvas = self.process_image(raw, palette)
-        path = str(out / f"{name}.png")
-        canvas.save(path)
-        canvas.save(str(out / f"{name}_preview.png"), scale=8)
-        print(f"  {name}: done → {path}")
-        return path
-
 
 # ================================================================
-# One-shot convenience functions
+# Convenience
 # ================================================================
 
 def create_game_assets(
     characters: Dict[str, str],
-    items: Optional[Dict[str, str]] = None,
     output_dir: str = "./pixel_assets",
     style: str = "default",
-    size: int = 32,
+    size: int = 48,
     animations: List[str] = None,
-    palette: str = None,
 ) -> dict:
-    """One function to generate a complete game asset pack.
-
-    This is THE function LLMs should call. Everything is automatic.
-
-    Args:
-        characters: Dict of {name: description} for each character.
-        items: Optional dict of {name: description} for items.
-        output_dir: Where to save everything.
-        style: Art style ("stardew", "deadcells", "terraria", "celeste", "classic").
-        size: Sprite pixel size (32, 48, or 64).
-        animations: List of animations per character (default: idle, walk, attack, hurt).
-        palette: Optional palette name for color consistency.
-
-    Returns:
-        Dict with all asset paths.
+    """One function to generate a full game asset pack.
 
     Example:
         >>> from gclub_pixel.pipeline import create_game_assets
-        >>> assets = create_game_assets(
-        ...     characters={
-        ...         "knight": "medieval knight with silver plate armor and red cape, holding sword",
-        ...         "mage": "wizard in purple robes with pointed hat and glowing staff",
-        ...     },
-        ...     items={
-        ...         "hp_potion": "red health potion in glass bottle",
-        ...         "mana_potion": "blue mana potion in crystal vial",
-        ...     },
-        ...     style="classic",
-        ...     size=32,
-        ... )
+        >>> assets = create_game_assets({
+        ...     "knight": "medieval knight with silver armor and red cape",
+        ...     "mage": "wizard in purple robes with magic staff",
+        ... })
     """
-    pipe = PixelPipeline(target_size=size, style=style)
-    result = {"characters": {}, "items": {}}
-
-    # Characters
-    result["characters"] = pipe.create_party(
-        characters, output_dir=output_dir,
-        animations=animations, palette=palette,
-    )
-
-    # Items
-    if items:
-        for item_name, item_desc in items.items():
-            result["items"][item_name] = pipe.create_item(
-                item_desc, output_dir=output_dir,
-                name=item_name, palette=palette,
-            )
-
-    print(f"\n{'='*50}")
-    print(f"  ASSET PACK COMPLETE")
-    print(f"  Characters: {len(characters)}")
-    print(f"  Items: {len(items) if items else 0}")
-    print(f"  Style: {style}")
-    print(f"  Output: {output_dir}/")
-    print(f"{'='*50}")
-
-    return result
+    pipe = PixelPipeline(size=size, style=style)
+    results = {}
+    for name, desc in characters.items():
+        print(f"\n{'='*50}")
+        print(f"  Generating: {name}")
+        print(f"{'='*50}")
+        results[name] = pipe.create_character(desc, name=name, output_dir=output_dir, animations=animations)
+    return results
