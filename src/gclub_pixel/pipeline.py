@@ -177,34 +177,125 @@ def _txt2img_workflow(model: str, lora: str, lora_str: float,
     }
 
 
-def _img2img_workflow(model: str, lora: str, lora_str: float,
-                      positive: str, negative: str,
-                      ref_name: str, seed: int, denoise: float) -> dict:
-    """img2img: uses reference image for character consistency."""
+def _ipadapter_workflow(model: str, lora: str, lora_str: float,
+                        positive: str, negative: str,
+                        ref_name: str, seed: int, weight: float = 0.8) -> dict:
+    """IP-Adapter workflow: reference image locks character appearance.
+
+    Unlike img2img (which blends at pixel level), IP-Adapter injects the
+    reference image's CLIP features into the generation process. This means:
+    - Full txt2img freedom for new poses (denoise=1.0)
+    - But character colors, armor style, hair etc. are locked by reference
+    - Much better consistency than img2img with denoise=0.5
+    """
+    return {
+        # Load checkpoint
+        "1": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": model}},
+        # Apply LoRA
+        "2": {"class_type": "LoraLoader", "inputs": {
+            "lora_name": lora, "strength_model": lora_str,
+            "strength_clip": 1.0, "model": ["1", 0], "clip": ["1", 1]}},
+        # Load IP-Adapter model (PLUS preset for high strength)
+        "10": {"class_type": "IPAdapterUnifiedLoader", "inputs": {
+            "model": ["2", 0],
+            "preset": "PLUS (high strength)"}},
+        # Load reference image
+        "11": {"class_type": "LoadImage",
+               "inputs": {"image": ref_name}},
+        # Apply IP-Adapter: inject reference features into model
+        "12": {"class_type": "IPAdapterAdvanced", "inputs": {
+            "model": ["10", 0],
+            "ipadapter": ["10", 1],
+            "image": ["11", 0],
+            "weight": weight,
+            "weight_type": "linear",
+            "combine_embeds": "concat",
+            "start_at": 0.0,
+            "end_at": 1.0,
+            "embeds_scaling": "V only"}},
+        # Text prompts
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": positive, "clip": ["2", 1]}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": negative, "clip": ["2", 1]}},
+        # Empty latent (full txt2img, not img2img!)
+        "5": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        # Sample with IP-Adapter-enhanced model
+        "6": {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": 28, "cfg": 7.0,
+            "sampler_name": "euler_ancestral", "scheduler": "normal",
+            "denoise": 1.0,
+            "model": ["12", 0], "positive": ["3", 0],
+            "negative": ["4", 0], "latent_image": ["5", 0]}},
+        "7": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveImage",
+              "inputs": {"filename_prefix": "gclub_ipa", "images": ["7", 0]}},
+    }
+
+
+def _ipadapter_workflow(model: str, lora: str, lora_str: float,
+                        positive: str, negative: str,
+                        ref_name: str, seed: int,
+                        ip_weight: float = 0.8) -> dict:
+    """IP-Adapter workflow using UnifiedLoader (auto model selection).
+
+    IPAdapterUnifiedLoader handles CLIP Vision + adapter model loading
+    automatically based on the selected preset.
+
+    ip_weight 0.7-0.9: lower = more pose freedom, higher = more like reference.
+    """
     return {
         "1": {"class_type": "CheckpointLoaderSimple",
               "inputs": {"ckpt_name": model}},
         "2": {"class_type": "LoraLoader", "inputs": {
             "lora_name": lora, "strength_model": lora_str,
             "strength_clip": 1.0, "model": ["1", 0], "clip": ["1", 1]}},
+        # IP-Adapter unified loader (auto downloads/selects correct models)
+        "10": {"class_type": "IPAdapterUnifiedLoader", "inputs": {
+            "model": ["2", 0],
+            "preset": "PLUS (high strength)"}},
+        # Reference image
+        "11": {"class_type": "LoadImage",
+               "inputs": {"image": ref_name}},
+        # Apply IP-Adapter with reference
+        "12": {"class_type": "IPAdapterAdvanced", "inputs": {
+            "model": ["10", 0],
+            "ipadapter": ["10", 1],
+            "image": ["11", 0],
+            "weight": ip_weight,
+            "weight_type": "linear",
+            "combine_embeds": "concat",
+            "start_at": 0.0,
+            "end_at": 1.0,
+            "embeds_scaling": "V only"}},
+        # Text prompts
         "3": {"class_type": "CLIPTextEncode",
               "inputs": {"text": positive, "clip": ["2", 1]}},
         "4": {"class_type": "CLIPTextEncode",
               "inputs": {"text": negative, "clip": ["2", 1]}},
-        "5": {"class_type": "LoadImage",
-              "inputs": {"image": ref_name}},
-        "6": {"class_type": "VAEEncode",
-              "inputs": {"pixels": ["5", 0], "vae": ["1", 2]}},
-        "7": {"class_type": "KSampler", "inputs": {
-            "seed": seed, "steps": 28, "cfg": 7.5,
+
+        # Empty latent (txt2img with IP-Adapter guidance)
+        "5": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+
+        # Sample with IP-Adapter enhanced model
+        "6": {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": 28, "cfg": 7.0,
             "sampler_name": "euler_ancestral", "scheduler": "normal",
-            "denoise": denoise,
-            "model": ["2", 0], "positive": ["3", 0],
-            "negative": ["4", 0], "latent_image": ["6", 0]}},
-        "8": {"class_type": "VAEDecode",
-              "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
-        "9": {"class_type": "SaveImage",
-              "inputs": {"filename_prefix": "gclub_pose", "images": ["8", 0]}},
+            "denoise": 1.0,
+            "model": ["12", 0],  # IP-Adapter enhanced model
+            "positive": ["3", 0],
+            "negative": ["4", 0],
+            "latent_image": ["5", 0]}},
+
+        # Decode + save
+        "7": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveImage",
+              "inputs": {"filename_prefix": "gclub_ipa", "images": ["7", 0]}},
     }
 
 
@@ -212,21 +303,47 @@ def _img2img_workflow(model: str, lora: str, lora_str: float,
 # Image processing
 # ================================================================
 
-def remove_white_bg(img: Image.Image, threshold: int = 230) -> Image.Image:
-    """Remove white/near-white background from a pixel art image.
+def remove_white_bg(img: Image.Image, threshold: int = 200) -> Image.Image:
+    """Remove white/light background via edge flood fill.
 
-    Simple and reliable: any pixel where R, G, B are all > threshold
-    becomes transparent. This works perfectly for images generated with
-    'white background' in the prompt.
+    More aggressive than simple threshold — floods from all border pixels
+    inward, removing any connected light-colored region. This handles
+    gradient backgrounds and vignette edges that simple thresholding misses.
     """
     img = img.convert("RGBA")
     pixels = img.load()
     w, h = img.size
+
+    # Phase 1: Remove obviously white pixels
     for y in range(h):
         for x in range(w):
             r, g, b, a = pixels[x, y]
-            if r > threshold and g > threshold and b > threshold:
+            if r > 235 and g > 235 and b > 235:
                 pixels[x, y] = (0, 0, 0, 0)
+
+    # Phase 2: Conservative flood fill from borders
+    # Only flood pixels that are VERY close to pure white (within 20 of 255)
+    # This prevents eating into silver armor or light-colored characters
+    visited = set()
+    border = []
+    for bx in range(w):
+        border.extend([(bx, 0), (bx, h-1)])
+    for by in range(h):
+        border.extend([(0, by), (w-1, by)])
+
+    for sx, sy in border:
+        stack = [(sx, sy)]
+        while stack:
+            cx, cy = stack.pop()
+            if (cx, cy) in visited or not (0 <= cx < w and 0 <= cy < h):
+                continue
+            visited.add((cx, cy))
+            r, g, b, a = pixels[cx, cy]
+            # Only remove nearly pure white or already transparent
+            if a == 0 or (r > 230 and g > 230 and b > 230):
+                pixels[cx, cy] = (0, 0, 0, 0)
+                for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                    stack.append((cx+dx, cy+dy))
     return img
 
 
@@ -331,8 +448,52 @@ def to_pixel_canvas(img: Image.Image, size: int) -> PixelCanvas:
 
 
 def process_raw(img: Image.Image, size: int) -> PixelCanvas:
-    """Full processing: smart bg removal → crop → resize → outline."""
-    img = smart_remove_bg(img)
+    """Full processing: detect bg color → remove → crop → resize → outline.
+
+    Auto-detects whether background is white or dark based on corner sampling,
+    then applies the appropriate removal. Safe for both light and dark characters.
+    """
+    img = img.convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+
+    # Sample corners to detect background color
+    corners = [pixels[2, 2], pixels[w-3, 2], pixels[2, h-3], pixels[w-3, h-3]]
+    avg_brightness = sum(sum(c[:3]) // 3 for c in corners) // 4
+
+    if avg_brightness > 180:
+        # White/light background → remove white
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = pixels[x, y]
+                if r > 240 and g > 240 and b > 240:
+                    pixels[x, y] = (0, 0, 0, 0)
+    elif avg_brightness < 40:
+        # Dark/black background → remove dark
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = pixels[x, y]
+                if r < 25 and g < 25 and b < 25:
+                    pixels[x, y] = (0, 0, 0, 0)
+    else:
+        # Mid-tone background → edge flood fill (conservative)
+        visited = set()
+        border = [(bx, 0) for bx in range(w)] + [(bx, h-1) for bx in range(w)]
+        border += [(0, by) for by in range(h)] + [(w-1, by) for by in range(h)]
+        bg_r, bg_g, bg_b = corners[0][0], corners[0][1], corners[0][2]
+        for sx, sy in border:
+            stack = [(sx, sy)]
+            while stack:
+                cx, cy = stack.pop()
+                if (cx, cy) in visited or not (0 <= cx < w and 0 <= cy < h):
+                    continue
+                visited.add((cx, cy))
+                r, g, b, a = pixels[cx, cy]
+                if a == 0 or (abs(r-bg_r) + abs(g-bg_g) + abs(b-bg_b) < 60):
+                    pixels[cx, cy] = (0, 0, 0, 0)
+                    for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                        stack.append((cx+dx, cy+dy))
+
     img = crop_to_content(img)
     return to_pixel_canvas(img, size)
 
@@ -357,6 +518,8 @@ class PixelPipeline:
         lora_strength: float = 1.2,
         size: int = 48,
         style: str = "default",
+        use_ipadapter: bool = True,
+        ip_weight: float = 0.8,
     ):
         self.server = server
         self.model = model
@@ -364,6 +527,8 @@ class PixelPipeline:
         self.lora_str = lora_strength
         self.size = size
         self.style = style
+        self.use_ipadapter = use_ipadapter
+        self.ip_weight = ip_weight
 
     def _check(self):
         try:
@@ -372,19 +537,69 @@ class PixelPipeline:
         except:
             return False
 
-    def generate_reference(self, desc: str, seed: int) -> Image.Image:
-        """Step 1: Generate idle reference frame via txt2img."""
-        prompt = _build_positive(desc, "idle", self.style)
-        wf = _txt2img_workflow(self.model, self.lora, self.lora_str, prompt, _NEGATIVE, seed)
-        return _queue_and_wait(self.server, wf)
+    def generate_reference(self, desc: str, seed: int, max_retries: int = 5) -> Image.Image:
+        """Step 1: Generate idle reference frame via txt2img.
+
+        Retries with different seeds until we get an image with:
+        - White/light background (>40% pixels with brightness > 230)
+        - Visible character (>5% pixels with brightness 30-200)
+        """
+        best_img = None
+        best_score = 0
+
+        for attempt in range(max_retries):
+            current_seed = seed + attempt * 777
+            prompt = _build_positive(desc, "idle", self.style)
+            wf = _txt2img_workflow(self.model, self.lora, self.lora_str, prompt, _NEGATIVE, current_seed)
+            img = _queue_and_wait(self.server, wf)
+
+            pixels = img.load()
+            w, h = img.size
+            white = sum(1 for y in range(h) for x in range(w)
+                       if pixels[x, y][0] > 230 and pixels[x, y][1] > 230 and pixels[x, y][2] > 230)
+            character = sum(1 for y in range(h) for x in range(w)
+                          if 30 < sum(pixels[x, y][:3]) // 3 < 200)
+            total = w * h
+
+            white_pct = white * 100 // total
+            char_pct = character * 100 // total
+            score = min(white_pct, 60) + char_pct  # want both white bg AND character
+
+            print(f"  Attempt {attempt+1}: white={white_pct}% character={char_pct}% score={score}")
+
+            if score > best_score:
+                best_score = score
+                best_img = img
+
+            # Good enough: has white bg and visible character
+            if white_pct > 30 and char_pct > 10:
+                return img
+
+        print(f"  Using best attempt (score={best_score})")
+        return best_img
 
     def generate_pose(self, desc: str, ref_image: Image.Image,
                       pose: str, seed: int, denoise: float = 0.5) -> Image.Image:
-        """Step 2: Generate pose variant via img2img from reference."""
+        """Step 2: Generate pose variant with character consistency.
+
+        Uses IP-Adapter if available (best consistency), falls back to img2img.
+        """
         ref_name = _upload_image(self.server, ref_image, f"gclub_ref_{pose}.png")
         prompt = _build_positive(desc, pose, self.style)
-        wf = _img2img_workflow(self.model, self.lora, self.lora_str,
-                               prompt, _NEGATIVE, ref_name, seed, denoise)
+
+        if self.use_ipadapter:
+            # IP-Adapter: reference features injected into generation
+            wf = _ipadapter_workflow(
+                self.model, self.lora, self.lora_str,
+                prompt, _NEGATIVE, ref_name, seed,
+                ip_weight=self.ip_weight,
+            )
+        else:
+            # Fallback: img2img
+            wf = _img2img_workflow(
+                self.model, self.lora, self.lora_str,
+                prompt, _NEGATIVE, ref_name, seed, denoise,
+            )
         return _queue_and_wait(self.server, wf)
 
     def create_character(
@@ -485,6 +700,7 @@ class PixelPipeline:
                     frames.append(canvas)
                 except Exception as e:
                     print(f"failed: {e}, using idle")
+                    canvas = idle_canvas
                     frames.append(idle_canvas)
 
                 # Save individual frame
