@@ -22,6 +22,10 @@ from gclub_pixel.palette import Palette, get_palette, color_ramp, colored_outlin
 from gclub_pixel.sprite import Sprite
 from gclub_pixel.animation import Animation
 from gclub_pixel.body import CharacterBody
+from gclub_pixel.hires import HiResCanvas, quick_character
+from gclub_pixel.chargen import generate as generate_character
+from gclub_pixel.gemini import GeminiPixel, gemini_generate
+from gclub_pixel.templates import render_template, CHIBI_32
 from gclub_pixel.styles import create_styled_character, list_styles, get_style
 from gclub_pixel.skeleton import SkeletalAnimation
 from gclub_pixel.export import (
