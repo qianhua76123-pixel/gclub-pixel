@@ -22,6 +22,9 @@ from gclub_pixel.palette import (
     Palette,
     get_palette,
     resolve_color,
+    color_ramp,
+    colored_outline,
+    shade,
 )
 
 TRANSPARENT = (0, 0, 0, 0)
@@ -280,6 +283,149 @@ class PixelCanvas:
                 if self._in_bounds(nx, ny):
                     new_pixels[ny][nx] = self._pixels[y][x]
         self._pixels = new_pixels
+        return self
+
+    # ==================== Shaded Drawing ====================
+
+    def fill_rect_shaded(
+        self, x: int, y: int, w: int, h: int, base_color: Color,
+        light_dir: str = "top_left",
+    ) -> "PixelCanvas":
+        """Draw a rectangle with automatic 3-tone shading.
+
+        Creates volume by applying highlight on the light-facing edge,
+        mid-tone in the center, and shadow on the opposite edge.
+        This is the core technique that makes pixel art look professional.
+
+        Args:
+            x, y, w, h: Rectangle position and size.
+            base_color: RGB tuple for the mid-tone.
+            light_dir: Light direction ("top_left" default).
+
+        Example:
+            >>> c.fill_rect_shaded(4, 4, 16, 12, (100, 100, 200))
+        """
+        ramp = color_ramp(base_color, 5)
+        deep_shadow, shadow_c, base, highlight, bright = ramp
+
+        # Fill base
+        for py in range(max(0, y), min(self.height, y + h)):
+            for px in range(max(0, x), min(self.width, x + w)):
+                self._pixels[py][px] = (*base, 255)
+
+        if w < 3 or h < 3:
+            return self
+
+        # Top edge = highlight (light from top-left)
+        for px in range(max(0, x), min(self.width, x + w)):
+            if self._in_bounds(px, y):
+                self._pixels[y][px] = (*highlight, 255)
+            if h > 4 and self._in_bounds(px, y + 1):
+                self._pixels[y + 1][px] = (*highlight, 255)
+
+        # Left edge = highlight
+        for py in range(max(0, y), min(self.height, y + h)):
+            if self._in_bounds(x, py):
+                self._pixels[py][x] = (*highlight, 255)
+
+        # Top-left corner = bright highlight (specular)
+        if self._in_bounds(x + 1, y + 1):
+            self._pixels[y + 1][x + 1] = (*bright, 255)
+        if self._in_bounds(x, y):
+            self._pixels[y][x] = (*bright, 255)
+
+        # Bottom edge = shadow
+        for px in range(max(0, x), min(self.width, x + w)):
+            bot = y + h - 1
+            if self._in_bounds(px, bot):
+                self._pixels[bot][px] = (*shadow_c, 255)
+            if h > 4 and self._in_bounds(px, bot - 1):
+                self._pixels[bot - 1][px] = (*shadow_c, 255)
+
+        # Right edge = shadow
+        for py in range(max(0, y), min(self.height, y + h)):
+            right = x + w - 1
+            if self._in_bounds(right, py):
+                self._pixels[py][right] = (*shadow_c, 255)
+
+        # Bottom-right corner = deep shadow
+        br_x, br_y = x + w - 1, y + h - 1
+        if self._in_bounds(br_x, br_y):
+            self._pixels[br_y][br_x] = (*deep_shadow, 255)
+        if self._in_bounds(br_x - 1, br_y):
+            self._pixels[br_y][br_x - 1] = (*deep_shadow, 255)
+        if self._in_bounds(br_x, br_y - 1):
+            self._pixels[br_y - 1][br_x] = (*deep_shadow, 255)
+
+        return self
+
+    def fill_circle_shaded(
+        self, cx: int, cy: int, r: int, base_color: Color,
+    ) -> "PixelCanvas":
+        """Draw a filled circle with spherical shading.
+
+        Applies radial shading: bright highlight offset toward light source,
+        gradient falloff to shadow on the far side.
+
+        Example:
+            >>> c.fill_circle_shaded(16, 8, 6, (220, 180, 140))  # shaded head
+        """
+        ramp = color_ramp(base_color, 5)
+        deep_shadow, shadow_c, base, highlight, bright = ramp
+
+        # Light offset (top-left)
+        lx, ly = cx - r * 0.3, cy - r * 0.3
+
+        for py in range(max(0, cy - r), min(self.height, cy + r + 1)):
+            for px in range(max(0, cx - r), min(self.width, cx + r + 1)):
+                dx, dy = px - cx, py - cy
+                dist_sq = dx * dx + dy * dy
+                if dist_sq > r * r:
+                    continue
+                # Distance from light source (normalized 0-1)
+                ldx, ldy = px - lx, py - ly
+                light_dist = (ldx * ldx + ldy * ldy) ** 0.5 / (r * 2.2)
+                light_dist = min(1.0, max(0.0, light_dist))
+
+                if light_dist < 0.2:
+                    c = bright
+                elif light_dist < 0.4:
+                    c = highlight
+                elif light_dist < 0.65:
+                    c = base
+                elif light_dist < 0.85:
+                    c = shadow_c
+                else:
+                    c = deep_shadow
+
+                self._pixels[py][px] = (*c, 255)
+        return self
+
+    def colored_outline(self) -> "PixelCanvas":
+        """Add colored outlines instead of black.
+
+        Each outline pixel takes a darker version of its nearest
+        non-transparent neighbor's color. This is the professional
+        pixel art technique used in games like Celeste and Dead Cells.
+
+        Example:
+            >>> c.colored_outline()  # much better than .outline("black")
+        """
+        to_fill = {}
+        for y in range(self.height):
+            for x in range(self.width):
+                if self._pixels[y][x][3] > 0:
+                    for dy, dx in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+                        nx, ny = x + dx, y + dy
+                        if self._in_bounds(nx, ny) and self._pixels[ny][nx][3] == 0:
+                            if (nx, ny) not in to_fill:
+                                # Use the source pixel's color to derive outline
+                                sr, sg, sb, _ = self._pixels[y][x]
+                                outline_c = colored_outline((sr, sg, sb))
+                                to_fill[(nx, ny)] = (*outline_c, 255)
+
+        for (x, y), rgba in to_fill.items():
+            self._pixels[y][x] = rgba
         return self
 
     # ==================== Effects ====================

@@ -320,6 +320,76 @@ def get_palette(name: str) -> Palette:
     raise ValueError(f"Unknown palette: {name}. Available: {list(PALETTE_REGISTRY)}")
 
 
+def shade(r: int, g: int, b: int, factor: float) -> Color:
+    """Darken or lighten an RGB color by a factor.
+
+    factor < 1.0 = darker, factor > 1.0 = lighter.
+    Clamped to 0-255.
+
+    Example:
+        >>> shade(200, 100, 50, 0.6)   # 60% brightness → shadow
+        (120, 60, 30)
+        >>> shade(200, 100, 50, 1.3)   # 130% brightness → highlight
+        (255, 130, 65)
+    """
+    return (
+        max(0, min(255, int(r * factor))),
+        max(0, min(255, int(g * factor))),
+        max(0, min(255, int(b * factor))),
+    )
+
+
+def color_ramp(base: Color, steps: int = 5) -> List[Color]:
+    """Generate a shading ramp from a base color.
+
+    Returns [deep_shadow, shadow, base, highlight, bright_highlight].
+    This is the core of pixel art shading — every color area needs
+    multiple tones to show volume and light.
+
+    Args:
+        base: The mid-tone RGB color.
+        steps: Number of shades (default 5).
+
+    Returns:
+        List of RGB tuples from darkest to brightest.
+
+    Example:
+        >>> ramp = color_ramp((100, 140, 200))
+        >>> # Returns 5 shades: very dark → dark → base → light → very light
+    """
+    r, g, b = base
+    if steps == 3:
+        return [shade(r, g, b, 0.5), (r, g, b), shade(r, g, b, 1.4)]
+    elif steps == 4:
+        return [shade(r, g, b, 0.4), shade(r, g, b, 0.7), (r, g, b), shade(r, g, b, 1.35)]
+    else:  # 5
+        return [
+            shade(r, g, b, 0.3),   # deep shadow
+            shade(r, g, b, 0.6),   # shadow
+            (r, g, b),              # base / mid-tone
+            shade(r, g, b, 1.3),   # highlight
+            shade(r, g, b, 1.6),   # bright highlight
+        ]
+
+
+def colored_outline(base: Color) -> Color:
+    """Generate a colored outline from a base color.
+
+    Instead of pure black, pixel art looks better with dark-saturated outlines.
+    This shifts the color toward darker and slightly more saturated.
+
+    Example:
+        >>> colored_outline((100, 140, 200))  # blue → dark navy outline
+    """
+    r, g, b = base
+    # Darken to ~30% and slightly shift toward cool tones
+    return (
+        max(0, int(r * 0.25)),
+        max(0, int(g * 0.25)),
+        max(0, int(b * 0.3)),
+    )
+
+
 def resolve_color(color: ColorLike, palette: Optional[Palette] = None) -> Tuple[int, int, int, int]:
     """Resolve any color-like value to an RGBA tuple.
 
