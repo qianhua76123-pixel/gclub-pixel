@@ -142,7 +142,13 @@ class Animation:
             else:
                 f = self.base.copy()
                 # Replace all non-transparent pixels with flash color
-                rgba = f._resolve(color)
+                if isinstance(color, str) and f.palette is None:
+                    # Fallback: resolve common color names without palette
+                    color_map = {"white": (255,255,255), "red": (255,0,0), "blue": (0,0,255), "yellow": (255,255,0)}
+                    rgb = color_map.get(color.lower(), (255,255,255))
+                    rgba = (*rgb, 255)
+                else:
+                    rgba = f._resolve(color)
                 for y in range(f.height):
                     for x in range(f.width):
                         if f._pixels[y][x][3] > 0:
